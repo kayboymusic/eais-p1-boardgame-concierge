@@ -1,0 +1,29 @@
+{
+  "system": "systems/compound.py",
+  "starter_version": "2026-10-05.2",
+  "backend": "course",
+  "model": null,
+  "variant": "compound",
+  "max_calls": 10,
+  "requests_file": "data/public.jsonl",
+  "requests": 150,
+  "errors": 0,
+  "declined": 35,
+  "model_calls": {
+    "total": 260,
+    "max_per_request": 4
+  },
+  "cost_usd": 0.031,
+  "seconds": 82.8,
+  "overrides": [],
+  "steps": {
+    "read_description": {
+      "input": "DescriptionQuestions",
+      "output": "DescriptionFacts"
+    },
+    "read_request": {
+      "input": "RequestText",
+      "output": "Requirements"
+    }
+  }
+}
