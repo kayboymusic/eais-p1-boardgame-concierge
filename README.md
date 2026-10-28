@@ -6,70 +6,291 @@ Both systems take one person's request and five candidate games, and return the 
 requirement, or a decline when none does. The right answers follow `RUBRIC.md`. The starter code's own README is
 kept at the end of this file.
 
-## What we built
+## How the project fits together
 
-### Single-call system: `systems/single.py`
+Every system is a Python file that defines `VARIANT` and `answer(request) -> Answer`. The starter code (`p1/`,
+which we don't change) does everything around it:
 
-One model call per request. The prompt is our summary of the rubric (`INSTRUCTIONS`), then the answer format
-(`FORMAT`), then the request and the five games.
+| Part | File | What it does |
+| --- | --- | --- |
+| Input and output types | `p1/types.py` | `Request` is the person's text plus five `Candidate` games (A to E), each with a fact `Card` (players, minutes, age, complexity weight, types, categories, mechanics) and a description. `Answer` is `pick` (a letter or `null` to decline) and `explanation`. |
+| Model calls | `p1/llm.py` | `call_json(prompt, Type)` sends one prompt to the course model and parses the JSON reply into `Type`. It counts calls and refuses one past the limit: 1 for `single`, 10 for `compound`. |
+| Prompt text | `p1/render.py` | `render_request(request)` turns a request and its five games into plain text for a prompt. |
+| Declared steps | `p1/steps.py` | `@step` checks a step's input and output types, records them in the trace, and lets labels stand in for a step's output (the swap-in test). |
+| Runner | `p1/run.py` | `python -m p1.run` runs a system on a file of requests and writes `answers.jsonl`, `traces.jsonl` and `summary.json` to a run folder. |
+| Checks | `p1/contracts.py`, `p1/connected.py` | Call limits and contracts of a run; whether a compound system's model steps are connected. |
+| Labels | `p1/labels.py`, `p1/app.py` | Send step inputs to the course app, pull labels, and measure a step's accuracy against them. |
 
-- The format asks the model to list the requirements and check every game against each one before it picks, so
-  that the pick comes after the working rather than before it. Our `answer()` reads only `pick` and `explanation`.
-- A reply that isn't the JSON we asked for, or whose pick isn't one of the five letters, becomes a decline. The
-  call limit is 1, so the system can't ask again.
+---
 
-### Compound system: `systems/compound.py`
+## Milestone 1: single-call system and scorer (due Wed 7 Oct)
 
-Two model steps and two code steps. At most 7 model calls per request (the limit is 10); on the public requests
-it made at most 4.
+**Requirement:** a single-call system with our own prompt that passes the quick checks and does clearly better than
+random guessing. Picking at random among five games or declining gets about 1 or 2 of 10 right.
 
-| Order | Step | Kind | What it does |
-|---|---|---|---|
-| 1 | `read_request` | model | Reads only the request text and returns its requirements: `players`, `max_minutes`, `complexity`, `mode`, `child_age`, and five yes/no `no_...` fields for things to avoid. Wishes are left out. Retries once if the reply doesn't fit. |
-| 2 | `check_card` | code | Checks each game's card against the requirements. Players, play time, age, cooperative or competitive, and the tags for things to avoid are exact lookups. The complexity rules of the rubric (light, medium, heavy, from weight and game types) are coded in `is_light`, `is_heavy` and `check_complexity`. Each requirement gets meets, breaks, can't tell, or ask. |
-| 3 | `read_description` | model | Only for a game the card hasn't ruled out, and only for the questions the card left open ("ask"): a player count, play time or age the card doesn't list, what the description says about the rules, and whether the game has fighting, violence, horror, a timer or player elimination. |
-| 4 | `answer` | code | Picks the first game that meets every requirement, or declines, with one reason per game. |
+The files below hold our Milestone 1 code, as we submitted it on Gradescope.
 
-Design choices:
+### `systems/single.py`: one model call per request
 
-- **Code does what code can do exactly.** In the single-call runs the model often marked a game as meeting
-  everything and then declined anyway, or got simple range checks wrong. In the compound system, the model only
-  reads language (the request, a description), and code does every comparison and the final decision.
-- **The model is only asked open questions.** A game that the card alone shows to be acceptable is picked with no
-  description call, and a game that no description could rescue is dropped without one.
-- **Every model step has fields with fixed choices**, so we could label them and measure each step on its own.
+The whole system is one prompt and one call:
 
-## How to run
-
-You need Python 3.10 or newer. From this folder, on macOS or Linux:
-
+```python
+def answer(request: Request) -> Answer:
+    return call_json(f"{INSTRUCTIONS}\n\n{FORMAT}\n\n{render_request(request)}", Answer)
 ```
-python3 -m venv .venv
-. .venv/bin/activate
-pip install -e ".[test]"
+
+1. **`VARIANT = "single"`** tells the runner to allow exactly 1 model call per request. A second call fails.
+2. **`INSTRUCTIONS`** is our summary of `RUBRIC.md`. In order, it tells the model to:
+   - pick a game only if its card or description shows it meets *every* requirement, and otherwise decline; and
+     not to use outside knowledge about the games;
+   - find the requirements first: count the writer among the players ("I", "we", "us"), read play-time phrases
+     such as "about an hour" as an upper limit, and leave out wishes ("would be nice", "would love");
+   - check each game against each kind of requirement:
+     - **Players:** the number must be inside the card's range. Use the description only if the card doesn't
+       list players. Expansions don't count.
+     - **Play time:** the card's longest time must fit the limit. Learning time isn't play time.
+     - **Complexity:** the rubric's rules for light, heavy and medium, from the weight (1 to 5), the game types
+       and what the description says about the rules. Conflicting clues mean "can't tell".
+     - **Cooperative or competitive:** the "Cooperative Game" mechanic decides.
+     - **Things to avoid** (fighting, violence, horror, timer, player elimination): a card tag always counts.
+       The description can add a feature but can't remove a tag. Figures of speech don't count.
+     - **Age:** the game's minimum age must not be above the child's age.
+   - treat a game it can't check as unacceptable, and keep the explanation to one or two sentences.
+3. **`FORMAT`** asks for JSON only: `{"pick": "<letter or null>", "explanation": "..."}`.
+4. **`render_request(request)`** adds the request and the five games' cards and descriptions.
+5. **`call_json(..., Answer)`** makes the single call and parses the reply straight into an `Answer`.
+
+### `score.py`: how many answers in a run are right
+
+`score(run_dir, answers)` returns `(right, total, wrong_ids)`. `main()` prints `"N of M right"`, then each
+wrong id.
+
+1. **Load the right answers.** It reads the answers file (by default `data/public_answers.jsonl`) into a dict:
+   request id → list of acceptable letters. An empty list means the right answer is to decline.
+2. **Find the run's answers.** It accepts a run folder (it reads `answers.jsonl` inside) or the answers file
+   itself.
+3. **Check every answer.** For each line it adds 1 to `total`, then:
+   - an answer with an `"error"`, or an id missing from the answers file, is wrong;
+   - a pick is right if it is one of the acceptable letters;
+   - a decline (`pick` is `null`) is right only if the list of acceptable letters is empty.
+4. Every request in the run counts, so a run on 10 requests is scored out of 10.
+
+### Milestone 1 results
+
+| Run | System | Right | Model calls | Cost |
+| --- | --- | --- | --- | --- |
+| `runs/m1-single-test` | `systems/single.py`, first 10 public requests | 5 of 10 | 10 (1 per request) | $0.0041 |
+| `runs/m1-single-test-2` | same code, run again | 6 of 10 | 10 (1 per request) | $0.0022 |
+
+Both runs pass the call-limit and contract checks (`python -m p1.contracts`). 5 to 6 of 10 is clearly better than
+random guessing. On these 10 requests the system declined 4 times in both runs.
+
+---
+
+## Milestone 2: compound system and labels (due Fri 9 Oct)
+
+**Requirement:** a compound system with at least 2 connected model steps that passes the quick checks and does
+clearly better than random guessing, plus labels for the 10 public practice requests.
+
+### `systems/compound.py`: two model steps and two code steps
+
+At most 7 model calls per request (the limit is 10). On the public requests it made at most 4.
+
+| Order | Step | Kind | Input → output |
+| --- | --- | --- | --- |
+| 1 | `read_request` | model, `@step` | `RequestText` → `Requirements` |
+| 2 | `check_card` | plain Python | `Requirements` + one game's `Card` → a check per requirement |
+| 3 | `read_description` | model, `@step` | `DescriptionQuestions` → `DescriptionFacts` |
+| 4 | `answer` | plain Python | everything above → `Answer` |
+
+**Step 1, `read_request` (model).** It gets only the person's text, not the games.
+
+- Its output, `Requirements`, has one field per kind of requirement: `players`, `max_minutes`,
+  `complexity` (light/medium/heavy), `mode` (cooperative/competitive), `child_age`, and five yes/no fields
+  `no_fighting`, `no_violence`, `no_horror`, `no_timer` and `no_elimination`. Each field has fixed choices, so each
+  one can be labeled.
+- The prompt `READ_REQUEST` gives worked examples ("me and my three friends" is 4, "an hour tops" is 60) and says
+  to leave out wishes.
+- If the reply doesn't fit `Requirements`, it asks once more. If the second reply doesn't fit either, `answer`
+  declines.
+
+**Step 2, `check_card` (code).** It checks one game's card against the requirements. Each requirement gets one of
+four results: `meets`, `breaks`, `can't tell`, or `ask` (the card can't settle it, so ask the description).
+
+- **Players, play time, age:** exact range checks on the card. If the card doesn't list one, the result is
+  `ask`.
+- **Cooperative or competitive:** whether the card has the "Cooperative Game" mechanic.
+- **Things to avoid:** the rubric's tags (`TAGS`, e.g. Horror or Zombies for horror). A tag means `breaks`.
+  Without a tag the result is `ask`.
+- **Complexity:** `is_light`, `is_heavy` and `check_complexity` are the rubric's rules in code. `check_card` tries
+  all three things the description could say about the rules ("easy", "complex", "unclear"):
+  - if all three give the same result, the card alone decides;
+  - if none of them gives `meets`, the result is `can't tell`;
+  - otherwise the result is `ask`.
+
+**Step 3, `read_description` (model).** It runs only for a game the card hasn't ruled out, and asks only the
+questions the card left open.
+
+- Its input, `DescriptionQuestions`, is the game's name, its description, and an `ask_...` flag per open question.
+- `QUESTIONS` holds one prompt piece per question: players, minutes, age, rules, fighting, violence, horror,
+  timer and elimination. Each piece spells out what counts and what doesn't.
+- Its output, `DescriptionFacts`, has one field per question. Answers to questions that weren't asked are thrown
+  away.
+- **Our final change:** an `"easy"` or `"complex"` rules answer only stands if `rules_quote` is at least two words
+  that really appear in the description (checked by `quoted`). Otherwise it becomes `"unclear"`.
+- If the reply doesn't fit, every answer stays empty, so the game can't be picked.
+- `apply_facts` then replaces each `ask` with `meets`, `breaks` or `can't tell` from those facts.
+
+**Step 4, `answer` (code).**
+
+1. Run `read_request` once.
+2. Run `check_card` on all five games. A game with any `breaks` or `can't tell` is dropped. The first game
+   that meets everything on its card alone is picked straight away, with no description call.
+3. For each remaining game, run `read_description`, apply the facts, and pick the first game that now meets
+   everything.
+4. If no game is left, decline. The explanation gives one reason per game.
+
+**Why this design.** In the single-call runs the model often got simple range checks wrong, or marked a game as
+meeting everything and then declined anyway. Here the model only reads language (the request, a description),
+and code does every comparison and the final decision. The model is only asked questions the card can't answer.
+
+### Labels
+
+We sent the inputs of both model steps to the course app (`python -m p1.labels send`), labeled them there, and
+downloaded them with `python -m p1.labels pull`:
+
+| File | Step | Labeled inputs |
+| --- | --- | --- |
+| `labels/read_request.jsonl` | `read_request` | 20: 10 public practice requests (P…) and 10 hidden labeling requests (L…) |
+| `labels/read_description.jsonl` | `read_description` | 14: 9 from practice requests and 5 from labeling requests (`read_description` only runs when the card leaves a question open) |
+
+### Milestone 2 results
+
+| Check | Result |
+| --- | --- |
+| `runs/m2-compound-test`, first 10 public requests | 10 of 10 right, 15 model calls (at most 2 per request), $0.0019 |
+| `runs/m2-compound-test-2`, same code, run again | 10 of 10 right, 15 model calls, $0.0019 |
+| Call limits and contracts (`python -m p1.contracts runs/m2-compound-test-2`) | passed |
+| Connected model steps (`python -m p1.contracts systems/compound.py`) | passed: `read_request` and `read_description` are both connected |
+| `read_request` vs our labels, `runs/labeling-compound` | 10 of 10, every field right |
+| `read_description` vs our labels, `runs/labeling-compound` | 5 of 5, every field right |
+
+The full results on all 150 public requests and the 50 checkpoint requests are under [Results](#results) below.
+
+---
+
+## How to test, step by step
+
+You need Python 3.10 or newer (the Mac's built-in Python 3.9 is too old). Run each command from this folder.
+
+**Setup, once:**
+
+```bash
+uv venv --python 3.12 .venv
+```
+
+```bash
+source .venv/bin/activate
+```
+
+```bash
+uv pip install -e ".[test]"
+```
+
+Without `uv`: `python3.12 -m venv .venv`, then `pip install -e ".[test]"`.
+
+**Every new terminal:** turn on the environment and load the token. `.env` holds the two `export` lines from the
+course app's Project 1 page, `P1_ENDPOINT` and `P1_TOKEN`. It is in `.gitignore`, so it is never committed.
+
+```bash
+source .venv/bin/activate
+```
+
+```bash
+source .env
+```
+
+**1. Starter tests** (no model calls, free). Expect 39 passed.
+
+```bash
 python -m pytest
 ```
 
-Set `P1_ENDPOINT` and `P1_TOKEN` from the course app's Project 1 page (`P1_BACKEND=fake` runs without a model).
-Then:
+**2. Milestone 1 scorer on saved runs** (free). Expect `137 of 150 right` and `48 of 50 right`.
 
+```bash
+python score.py runs/compound-fix-1
 ```
-# Run a system and score the run
-python -m p1.run systems/compound.py --requests data/public.jsonl --out runs/compound-x
-python -m p1.run systems/single.py --requests data/public.jsonl --out runs/single-x
-python score.py runs/compound-x
 
-# Checkpoint requests: score against their own answers
-python -m p1.run systems/compound.py --requests data/checkpoint_requests.jsonl --out runs/checkpoint-x
-python score.py runs/checkpoint-x --answers data/checkpoint_answers.jsonl
+```bash
+python score.py runs/checkpoint-compound-fix --answers data/checkpoint_answers.jsonl
+```
 
-# Contracts and call limits of a run; connected model steps
-python -m p1.contracts runs/compound-x
+**3. Milestone 1 single-call system** (uses the team budget, about $0.004). Give each run a new `--out` folder.
+
+```bash
+python -m p1.run systems/single.py --requests data/public.jsonl --limit 10 --out runs/m1-single-test-3
+```
+
+```bash
+python score.py runs/m1-single-test-3
+```
+
+```bash
+python -m p1.contracts runs/m1-single-test-3
+```
+
+**4. Milestone 2 compound system** (uses the team budget, about $0.002).
+
+```bash
+python -m p1.run systems/compound.py --requests data/public.jsonl --limit 10 --out runs/m2-compound-test-3
+```
+
+```bash
+python score.py runs/m2-compound-test-3
+```
+
+```bash
+python -m p1.contracts runs/m2-compound-test-3
+```
+
+**5. Milestone 2 checks** (free).
+
+```bash
 python -m p1.contracts systems/compound.py
+```
 
-# A model step's accuracy against our labels (labels/ comes from python -m p1.labels pull)
+```bash
+python -m p1.labels accuracy runs/labeling-compound --step read_request --labels labels/read_request.jsonl
+```
+
+```bash
 python -m p1.labels accuracy runs/labeling-compound --step read_description --labels labels/read_description.jsonl
 ```
+
+**Other runs.** Leave out `--limit 10` to run all 150 public requests. Use
+`--requests data/checkpoint_requests.jsonl` and score with `--answers data/checkpoint_answers.jsonl` for the 50
+checkpoint requests. Set `P1_BACKEND=fake` to run without the model, at no cost.
+
+### What the starter tests cover
+
+| File | What it checks |
+| --- | --- |
+| `tests/test_score.py` | `score.py` prints the count and then the wrong ids, and accepts another answers file with `--answers`. |
+| `tests/test_starter.py` | The data fits the types; the single variant refuses a second call; a compound system is limited to 10 calls, all inside steps; contracts are checked and reported; traces, the swap-in test, step accuracy and the model backends work. |
+| `tests/test_connected.py` | The connected-steps check: unused or pointless steps don't count as connected; steps that feed the answer do. |
+| `tests/test_labels_app.py` | `p1.labels send` and `pull`: sending step inputs without the model, and pulled labels working for the swap-in test and step accuracy. |
+
+---
+
+## Checkpoint and final (13 and 16 Oct)
+
+The sections below are the write-up of our final submission: results on all 150 public requests and the 50
+checkpoint requests, error analysis, and the one change we made and measured. The single-call numbers in them
+(`single-3`, `single-4`, `checkpoint-single`) come from a later version of `systems/single.py`. That version had
+a longer prompt, asked the model to list the requirements and check each game before picking, and declined when
+the reply was broken. It is in the git history at commit `0c375f8`. The compound numbers come from the
+`systems/compound.py` in this folder.
 
 ## Results
 
@@ -79,7 +300,7 @@ the requests' own times (the runner works on 4 requests at once).
 ### Public requests (150), two runs of each system
 
 | System | Run | Right | Cost per request | Median time |
-|---|---|---|---|---|
+| --- | --- | --- | --- | --- |
 | Single call | `single-3` | 75 of 150 (50%) | $0.00049 | 3.2 s |
 | Single call | `single-4` | 85 of 150 (57%) | $0.00049 | 2.9 s |
 | Compound, before our change | `compound-2` | 130 of 150 (87%) | $0.00021 | 2.2 s |
@@ -97,7 +318,7 @@ the requests' own times (the runner works on 4 requests at once).
 ### Checkpoint requests (50)
 
 | System | Run | Right |
-|---|---|---|
+| --- | --- | --- |
 | Single call | `checkpoint-single` | 29 of 50 (58%) |
 | Compound, before our change | `checkpoint-compound` | 45 of 50 (90%) |
 | Compound, after our change | `checkpoint-compound-fix` | 48 of 50 (96%) |
@@ -113,7 +334,7 @@ requests that is 10 labels for `read_request` and 5 for `read_description` (the 
 without a description call).
 
 | Step | Requests | Labeled inputs | Right in all labeled fields | Run |
-|---|---|---|---|---|
+| --- | --- | --- | --- | --- |
 | `read_request` | hidden labeling | 10 | 10 of 10 | `labeling-compound` |
 | `read_description` | hidden labeling | 5 | 5 of 5 | `labeling-compound` |
 
@@ -137,7 +358,7 @@ answers no violence only.
 All 5 failures are declines where a game was acceptable.
 
 | Request | What went wrong | Step |
-|---|---|---|
+| --- | --- | --- |
 | H1-006 | Read "a game that everyone can play together" as a cooperative requirement, which ruled out E, a competitive game that fit everything else. | `read_request` |
 | H1-016 | Answered that the rules are "complex" from "planning and strategy" in the description, which ruled out D (strategy, weight 2.89, medium by the card). | `read_description` |
 | H1-030 | Turned the wish "It would be nice if the game can be played either PvP or co-op" into a cooperative requirement, which ruled out C and E. | `read_request` |
@@ -145,7 +366,7 @@ All 5 failures are declines where a game was acceptable.
 | H1-088 | Answered that the rules are "complex" with the evidence "none", which ruled out D (weight 2.8, medium by the card). | `read_description` |
 
 | Group | Count |
-|---|---|
+| --- | --- |
 | `read_description` claims rules wording that the description doesn't have | 3 |
 | `read_request` invents a cooperative requirement (a wish, or "play together") | 2 |
 
@@ -170,7 +391,7 @@ it, and code checks the quote.**
 The step's inputs didn't change, and `rules_quote` is free text, so our labels still fit.
 
 | | Before | After |
-|---|---|---|
+| --- | --- | --- |
 | Public, run 1 | 130 of 150 (`compound-2`) | 137 of 150 (`compound-fix-1`) |
 | Public, run 2 | 131 of 150 (`compound-3`) | 135 of 150 (`compound-fix-2`) |
 | Checkpoint (development data) | 45 of 50 (`checkpoint-compound`) | 48 of 50 (`checkpoint-compound-fix`) |
@@ -221,13 +442,15 @@ not chance.
 ## Runs in this repository
 
 | Folder | System | Requests |
-|---|---|---|
+| --- | --- | --- |
 | `runs/single-3`, `runs/single-4` | single call | public |
 | `runs/compound-2`, `runs/compound-3` | compound, before the change | public |
 | `runs/compound-fix-1`, `runs/compound-fix-2` | compound, after the change | public |
 | `runs/checkpoint-single`, `runs/checkpoint-compound` | single call; compound before the change | checkpoint |
 | `runs/checkpoint-compound-fix` | compound, after the change | checkpoint |
 | `runs/labeling-compound` | compound, after the change | hidden labeling (for step accuracy) |
+| `runs/m1-single-test`, `runs/m1-single-test-2` | Milestone 1 single call (current `systems/single.py`) | first 10 public |
+| `runs/m2-compound-test`, `runs/m2-compound-test-2` | compound, after the change | first 10 public |
 
 Earlier runs (`single-1`, `single-2`, `compound-1`) were 10-request development runs and aren't reported.
 
@@ -243,7 +466,7 @@ to submit.
 ## Files
 
 | File | What it holds |
-|---|---|
+| --- | --- |
 | `RUBRIC.md` | the rubric: how we decide the right answer for every request |
 | `data/public.jsonl` | the 150 public requests, each with its five candidate games |
 | `data/public_answers.jsonl` | the right answer to each public request: the letters of the acceptable games, or an empty list when the right answer is to decline |
