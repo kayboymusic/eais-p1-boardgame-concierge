@@ -13,51 +13,52 @@ You see how many of the run's requests are right, then the id of each request th
 
 Write score() below, and keep main() as it is. When we grade your scorer, we call your score() on test runs of
 our own.
+
+When an answer counts as right:
+- `answers.jsonl` in the run folder has one line per request: {"id": ..., "pick": ..., "explanation": ...}, plus
+  "error" if the system failed on that request.
+- The answers file, `data/public_answers.jsonl` unless you give another one, has the right answer for each request:
+  {"id": ..., "correct": [...]}, the letters of the acceptable games, or an empty list when the right answer is to
+  decline.
+- A pick is right if it's one of the listed letters. A decline ("pick": null) is right if the list is empty.
+- A request with an "error" counts as wrong.
+- Count every request in the run, so a run on 10 requests is scored out of 10.
+
+To read a .jsonl file one dict per line, you can use `read_jsonl` from `p1.io`.
 """
 from __future__ import annotations
 
 import argparse
 from pathlib import Path
+
 from p1.io import read_jsonl
 
 
 def score(run_dir: str, answers: str = "data/public_answers.jsonl") -> tuple[int, int, list[str]]:
     """Score the run in run_dir against the answers file. Return (right, total, wrong_ids): the number of right
     answers, the number of requests in the run, and the ids of the wrong ones, in the run's order."""
-    
-    # 1. Build lookup map from ground truth file: {request_id: list_of_correct_letters}
-    correct_map = {}
-    for entry in read_jsonl(answers):
-        correct_map[entry["id"]] = entry.get("correct", [])
-
-    # 2. Locate answers.jsonl whether run_dir is a folder or direct file path
-    run_path = Path(run_dir)
-    answers_file = run_path / "answers.jsonl" if run_path.is_dir() else run_path
-
+    correct = {row["id"]: row["correct"] for row in read_jsonl(answers)}
     right = 0
     total = 0
     wrong_ids = []
-
-    # 3. Check each request answer against the ground truth map
-    for record in read_jsonl(answers_file):
+    for row in read_jsonl(Path(run_dir) / "answers.jsonl"):
         total += 1
-        req_id = record.get("id")
-        pick = record.get("pick")
-
-        # Runtime errors or missing IDs count as wrong
-        if "error" in record or req_id not in correct_map:
-            wrong_ids.append(req_id)
-            continue
-
-        acceptable_picks = correct_map[req_id]
-
-        # A pick is right if in acceptable_picks; null is right if acceptable_picks is empty
-        if pick in acceptable_picks or (pick is None and len(acceptable_picks) == 0):
+        if _is_right(row, correct.get(row["id"])):
             right += 1
         else:
-            wrong_ids.append(req_id)
-
+            wrong_ids.append(row["id"])
     return right, total, wrong_ids
+
+
+def _is_right(row: dict, acceptable: list[str] | None) -> bool:
+    """Is this answer right? acceptable is the request's list of right letters, or None if the answers file
+    doesn't have the request."""
+    if row.get("error") or acceptable is None:
+        return False
+    pick = row.get("pick")
+    if pick is None:
+        return not acceptable  # a decline is right only when no game is acceptable
+    return pick in acceptable
 
 
 def main() -> None:
